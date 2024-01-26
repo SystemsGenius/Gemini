@@ -16,7 +16,8 @@ import numpy as np
 import pandas as pd
 import requests
 import seaborn as sns
-from vertexai.language_models import TextEmbeddingModel
+
+from vertexai.vision_models import MultiModalEmbeddingModel
 from vertexai.preview.generative_models import (
     Content,
     GenerationConfig,
@@ -30,7 +31,9 @@ from vertexai.preview.generative_models import (
 
 
 def get_text_embedding_from_text_embedding_model(
-    project_id: str, text: str, embedding_size: int = 128
+    project_id: str,
+    text: str,
+    embedding_size: int = 128,
 ) -> list:
     """
     Returns an embedding (as a list) based on input text, using a multimodal embedding modal:
@@ -44,7 +47,6 @@ def get_text_embedding_from_text_embedding_model(
     Returns:
         A list representing the text embedding.
     """
-
     # Create a client to interact with the Vertex AI Prediction Service
     client = aiplatform.gapic.PredictionServiceClient(
         client_options={"api_endpoint": "us-central1-aiplatform.googleapis.com"}
@@ -113,9 +115,9 @@ def get_image_embedding_from_multimodal_embedding_model(
 
     # Convert the image content to Base64 encoded string if provided
     if image_uri:
-        image_content = load_image_bytes(image_uri)
-        encoded_content = b64encode(image_content).decode("utf-8")
-        instance["image"] = {"bytesBase64Encoded": encoded_content}
+        instance["image"] = {
+            "bytesBase64Encoded": b64encode(load_image_bytes(image_uri)).decode("utf-8")
+        }
 
     instances = [instance]
 
@@ -248,7 +250,9 @@ def get_text_overlapping_chunk(
 
 
 def get_page_text_embedding(
-    project_id: str, text_data: typing.Union[dict, str], embedding_size: int = 128
+    model: MultiModalEmbeddingModel,
+    text_data: typing.Union[dict, str],
+    embedding_size: int = 128,
 ) -> dict:
     """
     * Generates embeddings for each text chunk using a specified embedding model.
@@ -264,28 +268,24 @@ def get_page_text_embedding(
 
     """
 
-    embeddings_dict = {}
-
     if isinstance(text_data, dict):
-        # Process each chunk
-        # print(text_data)
-        for chunk_number, chunk_value in text_data.items():
-            text_embd = get_text_embedding_from_text_embedding_model(
-                project_id=project_id, text=chunk_value, embedding_size=embedding_size
-            )
-            embeddings_dict[chunk_number] = text_embd
-    else:
-        # Process the first 1000 characters of the page text
-        text_embd = get_text_embedding_from_text_embedding_model(
-            project_id=project_id, text=text_data[:1000], embedding_size=embedding_size
-        )
-        embeddings_dict["text_embedding"] = text_embd
+        return {
+            chunk_number: model.get_embeddings(
+                contextual_text=chunk_value, dimension=embedding_size
+            ).text_embedding
+            for chunk_number, chunk_value in text_data.items()
+        }
 
-    return embeddings_dict
+    # Process the first 1000 characters of the page text
+    return {
+        "text_embedding": model.get_embeddings(
+            contextual_text=text_data[:1000], dimension=embedding_size
+        ).text_embedding
+    }
 
 
 def get_chunk_text_metadata(
-    project_id: str,
+    embedding_model: MultiModalEmbeddingModel,
     page: fitz.Page,
     character_limit: int = 1000,
     overlap: int = 100,
@@ -322,18 +322,16 @@ def get_chunk_text_metadata(
 
     # Get whole-page text embeddings
     page_text_embeddings_dict: dict = get_page_text_embedding(
-        project_id, text, embedding_size
+        embedding_model, text, embedding_size
     )
 
     # Chunk the text with the given limit and overlap
     chunked_text_dict: dict = get_text_overlapping_chunk(text, character_limit, overlap)
-    # print(chunked_text_dict)
 
     # Get embeddings for the chunks
     chunk_embeddings_dict: dict = get_page_text_embedding(
-        project_id, chunked_text_dict, embedding_size
+        embedding_model, chunked_text_dict, embedding_size
     )
-    # print(chunk_embeddings_dict)
 
     # Return all extracted data
     return text, page_text_embeddings_dict, chunked_text_dict, chunk_embeddings_dict
@@ -398,26 +396,17 @@ def get_gemini_response(
     Returns:
         The generated text as a string.
     """
+    response = generative_multimodal_model.generate_content(
+        model_input,
+        generation_config=GenerationConfig(max_output_tokens=2048, temperature=0.1),
+        stream=stream,
+    )
 
-    generation_config = {"max_output_tokens": 2048, "temperature": 0.1}
-
-    if stream:
-        response = generative_multimodal_model.generate_content(
-            model_input,
-            generation_config=generation_config,
-            stream=stream,
-        )
-        response_list = []
-        for chunk in response:
-            response_list.append(chunk.text)
-        response = "".join(response_list)
-    else:
-        response = generative_multimodal_model.generate_content(
-            model_input, generation_config=generation_config
-        )
-        response = response.candidates[0].content.parts[0].text
-
-    return response
+    return (
+        "".join([chunk.text for chunk in response])
+        if stream
+        else response.candidates[0].content.parts[0].text
+    )
 
 
 def get_text_metadata_df(
@@ -436,27 +425,21 @@ def get_text_metadata_df(
     Returns:
         A Pandas DataFrame with the extracted text, chunk text, and chunk embeddings for each page.
     """
+    final_data_text: List[Dict[str, Union[str, int]]] = [
+        {
+            "file_name": filename,
+            "page_num": int(page_num) + 1,
+            "text": values["text"],
+            "text_embedding_page": values["page_text_embeddings"]["text_embedding"],
+            "chunk_number": chunk_number,
+            "chunk_text": chunk_text,
+            "text_embedding_chunk": values["chunk_embeddings_dict"][chunk_number],
+        }
+        for page_num, values in text_metadata.items()
+        for chunk_number, chunk_text in values["chunked_text_dict"].items()
+    ]
 
-    final_data_text: List[Dict] = []
-
-    for key, values in text_metadata.items():
-        for chunk_number, chunk_text in values["chunked_text_dict"].items():
-            data: Dict = {}
-            data["file_name"] = filename
-            data["page_num"] = key + 1
-            data["text"] = values["text"]
-            data["text_embedding_page"] = values["page_text_embeddings"][
-                "text_embedding"
-            ]
-            data["chunk_number"] = chunk_number
-            data["chunk_text"] = chunk_text
-            data["text_embedding_chunk"] = values["chunk_embeddings_dict"][chunk_number]
-
-            final_data_text.append(data)
-
-    return_df = pd.DataFrame(final_data_text)
-    return_df = return_df.reset_index(drop=True)
-    return return_df
+    return pd.DataFrame(final_data_text).reset_index(drop=True)
 
 
 def get_image_metadata_df(
@@ -476,36 +459,31 @@ def get_image_metadata_df(
         A Pandas DataFrame with the extracted image path, image description, and image embeddings for each image.
     """
 
-    final_data_image: List[Dict] = []
-
-    for key, values in image_metadata.items():
-        data: Dict = {}
-        data["file_name"] = filename
-        data["page_num"] = key + 1
-
-        for image_number, image_values in values.items():
-            data["img_num"] = int(image_values["img_num"])
-            data["img_path"] = image_values["img_path"]
-            data["img_desc"] = image_values["img_desc"]
-            data["mm_embedding_from_text_desc_and_img"] = image_values[
+    final_data_image: List[Dict] = [
+        {
+            "file_name": filename,
+            "page_num": int(page_num) + 1,
+            "img_num": int(image_values["img_num"]),
+            "img_path": image_values["img_path"],
+            "img_desc": image_values["img_desc"],
+            "mm_embedding_from_text_desc_and_img": image_values[
                 "mm_embedding_from_text_desc_and_img"
-            ]
-            data["mm_embedding_from_img_only"] = image_values[
-                "mm_embedding_from_img_only"
-            ]
-            data["text_embedding_from_image_description"] = image_values[
+            ],
+            "mm_embedding_from_img_only": image_values["mm_embedding_from_img_only"],
+            "text_embedding_from_image_description": image_values[
                 "text_embedding_from_image_description"
-            ]
-            final_data_image.append(data)
+            ],
+        }
+        for page_num, values in image_metadata.items()
+        for _, image_values in values.items()
+    ]
 
-    return_df = pd.DataFrame(final_data_image).dropna()
-    return_df = return_df.reset_index(drop=True)
-    return return_df
+    return pd.DataFrame(final_data_image).dropna().reset_index(drop=True)
 
 
 def get_document_metadata(
-    project_id: str,
-    generative_multimodal_model,
+    embedding_model: MultiModalEmbeddingModel,
+    generative_multimodal_model: GenerativeModel,
     pdf_path: str,
     image_save_dir: str,
     image_description_prompt: str,
@@ -540,14 +518,14 @@ def get_document_metadata(
 
         page = doc[page_num]
 
-        text = page.get_text()
         (
             text,
             page_text_embeddings_dict,
             chunked_text_dict,
             chunk_embeddings_dict,
-        ) = get_chunk_text_metadata(project_id, page, embedding_size=embedding_size)
-        # print(text, page_text_embeddings_dict, chunked_text_dict, chunk_embeddings_dict)
+        ) = get_chunk_text_metadata(
+            embedding_model, page.get_text(), embedding_size=embedding_size
+        )
         text_metadata[page_num] = {
             "text": text,
             "page_text_embeddings": page_text_embeddings_dict,
@@ -555,10 +533,9 @@ def get_document_metadata(
             "chunk_embeddings_dict": chunk_embeddings_dict,
         }
 
-        images = page.get_images()
         image_metadata[page_num] = {}
 
-        for image_no, image in enumerate(images):
+        for image_no, image in enumerate(page.get_images()):
             image_number = int(image_no + 1)
             image_metadata[page_num][image_number] = {}
 
@@ -574,27 +551,18 @@ def get_document_metadata(
                 stream=True,
             )
 
-            image_embedding_with_description = (
-                get_image_embedding_from_multimodal_embedding_model(
-                    project_id=project_id,
-                    image_uri=image_name,
-                    text=response[:text_emb_text_limit],
-                    embedding_size=embedding_size,
-                )
+            image_embedding_with_description = embedding_model.get_embeddings(
+                image=image_for_gemini,
+                contextual_text=response[:text_emb_text_limit],
+                dimension=embedding_size,
             )
 
-            image_embedding = get_image_embedding_from_multimodal_embedding_model(
-                project_id=project_id,
-                image_uri=image_name,
-                embedding_size=embedding_size,
+            image_embedding = embedding_model.get_embeddings(
+                image=image_for_gemini, dimension=embedding_size
             )
 
-            image_description_text_embedding = (
-                get_text_embedding_from_text_embedding_model(
-                    project_id=project_id,
-                    text=response[:text_emb_text_limit],
-                    embedding_size=embedding_size,
-                )
+            image_description_text_embedding = embedding_model.get_embeddings(
+                contextual_text=response[:text_emb_text_limit], dimension=embedding_size
             )
 
             image_metadata[page_num][image_number] = {
