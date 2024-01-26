@@ -2,20 +2,18 @@
 from __future__ import annotations
 
 import logging
-import uuid
 from typing import Any, Iterable, List, Optional, Type
+import uuid
 
+import google.auth
+import google.auth.transport.requests
+from google.cloud import aiplatform_v1, storage
+from google.cloud.aiplatform import MatchingEngineIndex, MatchingEngineIndexEndpoint
+from google.oauth2.service_account import Credentials
 from langchain.docstore.document import Document
 from langchain.embeddings import TensorflowHubEmbeddings
 from langchain.embeddings.base import Embeddings
 from langchain.vectorstores.base import VectorStore
-
-from google.cloud import storage
-from google.cloud.aiplatform import MatchingEngineIndex, MatchingEngineIndexEndpoint
-from google.cloud import aiplatform_v1
-from google.oauth2.service_account import Credentials
-import google.auth
-import google.auth.transport.requests
 
 logger = logging.getLogger()
 
@@ -177,8 +175,9 @@ class MatchingEngine(VectorStore):
         Uses public endpoint
 
         """
-        import requests
         import json
+
+        import requests
 
         request_data = {
             "deployed_index_id": index_endpoint.deployed_indexes[0].id,
